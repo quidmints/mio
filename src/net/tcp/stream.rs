@@ -4,19 +4,23 @@ use std::io::{self, IoSlice, IoSliceMut, Read, Write};
 use crate::sys::tcp::net::{self, Shutdown, SocketAddr};
 #[cfg(not(target_env = "sgx"))]
 use std::net::{self, Shutdown, SocketAddr};
-#[cfg(unix)]
-use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
-#[cfg(target_os = "wasi")]
-use std::os::wasi::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
+#[cfg(any(unix, target_os = "wasi"))]
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+// TODO: once <https://github.com/rust-lang/rust/issues/126198> is fixed this
+// can use `std::os::fd` and be merged with the above.
+#[cfg(target_os = "hermit")]
+use std::os::hermit::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 #[cfg(windows)]
-use std::os::windows::io::{AsRawSocket, FromRawSocket, IntoRawSocket, RawSocket};
+use std::os::windows::io::{
+    AsRawSocket, AsSocket, BorrowedSocket, FromRawSocket, IntoRawSocket, OwnedSocket, RawSocket,
+};
 
 use crate::io_source::IoSource;
-#[cfg(not(any(target_os = "wasi", target_env = "sgx")))]
+#[cfg(not(any(all(target_os = "wasi", target_env = "p1"), target_env = "sgx")))]
 use crate::sys::tcp::{connect, new_for_addr};
-use crate::{event, Interest, Registry, Token};
 #[cfg(target_env = "sgx")]
 use crate::sys;
+use crate::{event, Interest, Registry, Token};
 
 /// A non-blocking TCP stream between a local socket and a remote socket.
 ///
@@ -55,13 +59,6 @@ pub struct TcpStream {
 }
 
 impl TcpStream {
-    #[cfg(target_env = "sgx")]
-    pub(crate) fn internal_new(stream: sys::tcp::TcpStream) -> TcpStream {
-        TcpStream {
-            inner: IoSource::new(stream),
-        }
-    }
-
     /// Create a new TCP stream and issue a non-blocking connect to the
     /// specified address.
     ///
@@ -80,23 +77,27 @@ impl TcpStream {
     ///  1. Call `TcpStream::connect`
     ///  2. Register the returned stream with at least [write interest].
     ///  3. Wait for a (writable) event.
-    ///  4. Check `TcpStream::peer_addr`. If it returns `libc::EINPROGRESS` or
+    ///  4. Check `TcpStream::take_error`. If it returns an error, then
+    ///     something went wrong. If it returns `Ok(None)`, then proceed to
+    ///     step 5.
+    ///  5. Check `TcpStream::peer_addr`. If it returns `libc::EINPROGRESS` or
     ///     `ErrorKind::NotConnected` it means the stream is not yet connected,
     ///     go back to step 3. If it returns an address it means the stream is
-    ///     connected, go to step 5. If another error is returned something
+    ///     connected, go to step 6. If another error is returned something
     ///     went wrong.
-    ///  5. Now the stream can be used.
+    ///  6. Now the stream can be used.
     ///
     /// This may return a `WouldBlock` in which case the socket connection
     /// cannot be completed immediately, it usually means there are insufficient
     /// entries in the routing cache.
     ///
     /// [write interest]: Interest::WRITABLE
-    #[cfg(not(target_os = "wasi"))]
+    #[cfg(not(all(target_os = "wasi", target_env = "p1")))]
     pub fn connect(addr: SocketAddr) -> io::Result<TcpStream> {
-        #[cfg(not(target_env = "sgx"))] {
+        #[cfg(not(target_env = "sgx"))]
+        {
             let socket = new_for_addr(addr)?;
-            #[cfg(unix)]
+            #[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
             let stream = unsafe { TcpStream::from_raw_fd(socket) };
             #[cfg(windows)]
             let stream = unsafe { TcpStream::from_raw_socket(socket as _) };
@@ -104,20 +105,28 @@ impl TcpStream {
             Ok(stream)
         }
 
-        #[cfg(target_env = "sgx")] {
+        #[cfg(target_env = "sgx")]
+        {
             sys::tcp::connect(addr).map(TcpStream::internal_new)
         }
     }
 
+    /// Wrap an already-connected SGX backend `TcpStream`.
+    #[cfg(target_env = "sgx")]
+    pub(crate) fn internal_new(stream: sys::tcp::TcpStream) -> TcpStream {
+        TcpStream {
+            inner: IoSource::new(stream),
+        }
+    }
+
     /// Create a new TCP stream and issue a non-blocking connect to the
-    /// specified address.
+    /// specified address (given as a string).
     #[cfg(target_env = "sgx")]
     pub fn connect_str(addr: &str) -> io::Result<TcpStream> {
         sys::tcp::connect_str(addr).map(TcpStream::internal_new)
     }
 
-    /// (quid)
-    /// Try to convert a `mio::TcpStream` into a `std::net::TcpStream`. Will
+    /// Try to convert a `mio::net::TcpStream` into a `std::net::TcpStream`. Will
     /// return an error if the stream is not yet connected.
     #[cfg(target_env = "sgx")]
     pub fn try_into_std(self) -> io::Result<std::net::TcpStream> {
@@ -136,6 +145,15 @@ impl TcpStream {
     /// The TCP stream here will not have `connect` called on it, so it
     /// should already be connected via some other means (be it manually, or
     /// the standard library).
+    #[cfg(not(target_env = "sgx"))]
+    pub fn from_std(stream: net::TcpStream) -> TcpStream {
+        TcpStream {
+            inner: IoSource::new(stream),
+        }
+    }
+
+    /// Creates a new `TcpStream` from a standard `net::TcpStream`.
+    #[cfg(target_env = "sgx")]
     pub fn from_std(stream: std::net::TcpStream) -> TcpStream {
         TcpStream {
             inner: IoSource::new(stream.into()),
@@ -238,7 +256,9 @@ impl TcpStream {
     /// Successive calls return the same data. This is accomplished by passing
     /// `MSG_PEEK` as a flag to the underlying recv system call.
     pub fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
-        self.inner.peek(buf)
+        // Need to re-register if `peek` returns `WouldBlock`
+        // to ensure the socket will receive more events once it is ready again.
+        self.inner.do_io(|inner| inner.peek(buf))
     }
 
     /// Execute an I/O operation ensuring that the socket receives more events
@@ -260,8 +280,8 @@ impl TcpStream {
     /// #
     /// # fn main() -> Result<(), Box<dyn Error>> {
     /// use std::io;
-    /// #[cfg(unix)]
-    /// use std::os::unix::io::AsRawFd;
+    /// #[cfg(any(unix, target_os = "wasi"))]
+    /// use std::os::fd::AsRawFd;
     /// #[cfg(windows)]
     /// use std::os::windows::io::AsRawSocket;
     /// use mio::net::TcpStream;
@@ -310,7 +330,7 @@ impl Read for TcpStream {
     }
 }
 
-impl<'a> Read for &'a TcpStream {
+impl Read for &'_ TcpStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.inner.do_io(|mut inner| inner.read(buf))
     }
@@ -334,7 +354,7 @@ impl Write for TcpStream {
     }
 }
 
-impl<'a> Write for &'a TcpStream {
+impl Write for &'_ TcpStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.inner.do_io(|mut inner| inner.write(buf))
     }
@@ -378,21 +398,21 @@ impl fmt::Debug for TcpStream {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
 impl IntoRawFd for TcpStream {
     fn into_raw_fd(self) -> RawFd {
         self.inner.into_inner().into_raw_fd()
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
 impl AsRawFd for TcpStream {
     fn as_raw_fd(&self) -> RawFd {
         self.inner.as_raw_fd()
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
 impl FromRawFd for TcpStream {
     /// Converts a `RawFd` to a `TcpStream`.
     ///
@@ -402,6 +422,33 @@ impl FromRawFd for TcpStream {
     /// non-blocking mode.
     unsafe fn from_raw_fd(fd: RawFd) -> TcpStream {
         TcpStream::from_std(FromRawFd::from_raw_fd(fd))
+    }
+}
+
+#[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
+impl From<TcpStream> for OwnedFd {
+    fn from(tcp_stream: TcpStream) -> Self {
+        tcp_stream.inner.into_inner().into()
+    }
+}
+
+#[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
+impl AsFd for TcpStream {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.inner.as_fd()
+    }
+}
+
+#[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
+impl From<OwnedFd> for TcpStream {
+    /// Converts a `RawFd` to a `TcpStream`.
+    ///
+    /// # Notes
+    ///
+    /// The caller is responsible for ensuring that the socket is in
+    /// non-blocking mode.
+    fn from(fd: OwnedFd) -> Self {
+        TcpStream::from_std(From::from(fd))
     }
 }
 
@@ -432,29 +479,48 @@ impl FromRawSocket for TcpStream {
     }
 }
 
-#[cfg(target_os = "wasi")]
-impl IntoRawFd for TcpStream {
-    fn into_raw_fd(self) -> RawFd {
-        self.inner.into_inner().into_raw_fd()
+#[cfg(windows)]
+impl From<TcpStream> for OwnedSocket {
+    fn from(tcp_stream: TcpStream) -> Self {
+        tcp_stream.inner.into_inner().into()
     }
 }
 
-#[cfg(target_os = "wasi")]
-impl AsRawFd for TcpStream {
-    fn as_raw_fd(&self) -> RawFd {
-        self.inner.as_raw_fd()
+#[cfg(windows)]
+impl AsSocket for TcpStream {
+    fn as_socket(&self) -> BorrowedSocket<'_> {
+        self.inner.as_socket()
     }
 }
 
-#[cfg(target_os = "wasi")]
-impl FromRawFd for TcpStream {
-    /// Converts a `RawFd` to a `TcpStream`.
+#[cfg(windows)]
+impl From<OwnedSocket> for TcpStream {
+    /// Converts a `RawSocket` to a `TcpStream`.
     ///
     /// # Notes
     ///
     /// The caller is responsible for ensuring that the socket is in
     /// non-blocking mode.
-    unsafe fn from_raw_fd(fd: RawFd) -> TcpStream {
-        TcpStream::from_std(FromRawFd::from_raw_fd(fd))
+    fn from(socket: OwnedSocket) -> Self {
+        TcpStream::from_std(From::from(socket))
+    }
+}
+
+#[cfg(not(target_env = "sgx"))]
+impl From<TcpStream> for net::TcpStream {
+    fn from(stream: TcpStream) -> Self {
+        // Safety: This is safe since we are extracting the raw fd from a well-constructed
+        // mio::net::TcpStream which ensures that we actually pass in a valid file
+        // descriptor/socket
+        unsafe {
+            #[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
+            {
+                net::TcpStream::from_raw_fd(stream.into_raw_fd())
+            }
+            #[cfg(windows)]
+            {
+                net::TcpStream::from_raw_socket(stream.into_raw_socket())
+            }
+        }
     }
 }

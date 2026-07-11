@@ -3,18 +3,16 @@
 //! Required types:
 //!
 //! * `Event`: a type alias for the system specific event, e.g. `kevent` or
-//!            `epoll_event`.
+//!   `epoll_event`.
 //! * `event`: a module with various helper functions for `Event`, see
-//!            [`crate::event::Event`] for the required functions.
+//!   [`crate::event::Event`] for the required functions.
 //! * `Events`: collection of `Event`s, see [`crate::Events`].
 //! * `IoSourceState`: state for the `IoSource` type.
 //! * `Selector`: selector used to register event sources and poll for events,
-//!               see [`crate::Poll`] and [`crate::Registry`] for required
-//!               methods.
+//!   see [`crate::Poll`] and [`crate::Registry`] for required methods.
 //! * `tcp` and `udp` modules: see the [`crate::net`] module.
 //! * `Waker`: see [`crate::Waker`].
 
-#[cfg(not(target_env = "sgx"))]
 cfg_os_poll! {
     macro_rules! debug_detail {
         (
@@ -52,7 +50,11 @@ cfg_os_poll! {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(
+    unix,
+    target_os = "hermit",
+    all(target_os = "wasi", not(target_env = "p1"))
+))]
 cfg_os_poll! {
     mod unix;
     #[allow(unused_imports)]
@@ -65,12 +67,13 @@ cfg_os_poll! {
     pub use self::windows::*;
 }
 
-#[cfg(target_os = "wasi")]
+#[cfg(all(target_os = "wasi", target_env = "p1"))]
 cfg_os_poll! {
-    mod wasi;
-    pub(crate) use self::wasi::*;
+    mod wasip1;
+    pub(crate) use self::wasip1::*;
 }
 
+// QU!D: in-enclave fortanix-sgx backend (async-usercalls event loop; see src/sys/sgx).
 #[cfg(target_env = "sgx")]
 cfg_os_poll! {
     mod sgx;
@@ -86,10 +89,5 @@ cfg_not_os_poll! {
         mod unix;
         #[cfg(feature = "os-ext")]
         pub use self::unix::SourceFd;
-    }
-
-    #[cfg(unix)]
-    cfg_net! {
-        pub use self::unix::SocketAddr;
     }
 }

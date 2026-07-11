@@ -2,19 +2,27 @@
 use crate::sys::tcp::net::{self, SocketAddr};
 #[cfg(not(target_env = "sgx"))]
 use std::net::{self, SocketAddr};
-#[cfg(unix)]
-use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
-#[cfg(target_os = "wasi")]
-use std::os::wasi::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
+#[cfg(any(unix, target_os = "wasi"))]
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+// TODO: once <https://github.com/rust-lang/rust/issues/126198> is fixed this
+// can use `std::os::fd` and be merged with the above.
+#[cfg(target_os = "hermit")]
+use std::os::hermit::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 #[cfg(windows)]
-use std::os::windows::io::{AsRawSocket, FromRawSocket, IntoRawSocket, RawSocket};
+use std::os::windows::io::{
+    AsRawSocket, AsSocket, BorrowedSocket, FromRawSocket, IntoRawSocket, OwnedSocket, RawSocket,
+};
 use std::{fmt, io};
 
 use crate::io_source::IoSource;
 use crate::net::TcpStream;
-#[cfg(unix)]
+#[cfg(any(
+    unix,
+    target_os = "hermit",
+    all(target_os = "wasi", not(target_env = "p1"))
+))]
 use crate::sys::tcp::set_reuseaddr;
-#[cfg(not(any(target_os = "wasi", target_env = "sgx")))]
+#[cfg(not(any(all(target_os = "wasi", target_env = "p1"), target_env = "sgx")))]
 use crate::sys::tcp::{bind, listen, new_for_addr};
 use crate::{event, sys, Interest, Registry, Token};
 
@@ -58,11 +66,12 @@ impl TcpListener {
     /// 2. Set the `SO_REUSEADDR` option on the socket on Unix.
     /// 3. Bind the socket to the specified address.
     /// 4. Calls `listen` on the socket to prepare it to receive new connections.
-    #[cfg(not(target_os = "wasi"))]
+    #[cfg(not(all(target_os = "wasi", target_env = "p1")))]
     pub fn bind(addr: SocketAddr) -> io::Result<TcpListener> {
-        #[cfg(not(target_env = "sgx"))] {
+        #[cfg(not(target_env = "sgx"))]
+        {
             let socket = new_for_addr(addr)?;
-            #[cfg(unix)]
+            #[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
             let listener = unsafe { TcpListener::from_raw_fd(socket) };
             #[cfg(windows)]
             let listener = unsafe { TcpListener::from_raw_socket(socket as _) };
@@ -78,11 +87,21 @@ impl TcpListener {
             set_reuseaddr(&listener.inner, true)?;
 
             bind(&listener.inner, addr)?;
-            listen(&listener.inner, 1024)?;
+            // Use the same backlog value as the standard libary.
+            // <https://github.com/rust-lang/rust/blob/0028f344ce9f64766259577c998a1959ca1f6a0b/library/std/src/sys/net/connection/socket/mod.rs#L559-L571>
+            let backlog = if cfg!(target_os = "horizon") {
+                20
+            } else if cfg!(target_os = "haiku") {
+                32
+            } else {
+                128
+            };
+            listen(&listener.inner, backlog)?;
             Ok(listener)
         }
 
-        #[cfg(target_env = "sgx")] {
+        #[cfg(target_env = "sgx")]
+        {
             Ok(TcpListener {
                 inner: IoSource::new(sys::tcp::bind(addr)?),
             })
@@ -90,7 +109,7 @@ impl TcpListener {
     }
 
     /// Convenience method to bind a new TCP listener to the specified address
-    /// to receive new connections.
+    /// (given as a string) to receive new connections.
     #[cfg(target_env = "sgx")]
     pub fn bind_str(addr: &str) -> io::Result<TcpListener> {
         Ok(TcpListener {
@@ -102,8 +121,17 @@ impl TcpListener {
     ///
     /// This function is intended to be used to wrap a TCP listener from the
     /// standard library in the Mio equivalent. The conversion assumes nothing
-    /// about the underlying listener; ; it is left up to the user to set it
-    /// in non-blocking mode.
+    /// about the underlying listener; it is left up to the user to set it
+    /// into non-blocking mode.
+    #[cfg(not(target_env = "sgx"))]
+    pub fn from_std(listener: net::TcpListener) -> TcpListener {
+        TcpListener {
+            inner: IoSource::new(listener),
+        }
+    }
+
+    /// Creates a new `TcpListener` from a standard `net::TcpListener`.
+    #[cfg(target_env = "sgx")]
     pub fn from_std(listener: std::net::TcpListener) -> TcpListener {
         TcpListener {
             inner: IoSource::new(listener.into()),
@@ -192,21 +220,21 @@ impl fmt::Debug for TcpListener {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
 impl IntoRawFd for TcpListener {
     fn into_raw_fd(self) -> RawFd {
         self.inner.into_inner().into_raw_fd()
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
 impl AsRawFd for TcpListener {
     fn as_raw_fd(&self) -> RawFd {
         self.inner.as_raw_fd()
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
 impl FromRawFd for TcpListener {
     /// Converts a `RawFd` to a `TcpListener`.
     ///
@@ -216,6 +244,33 @@ impl FromRawFd for TcpListener {
     /// non-blocking mode.
     unsafe fn from_raw_fd(fd: RawFd) -> TcpListener {
         TcpListener::from_std(FromRawFd::from_raw_fd(fd))
+    }
+}
+
+#[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
+impl From<TcpListener> for OwnedFd {
+    fn from(tcp_listener: TcpListener) -> Self {
+        tcp_listener.inner.into_inner().into()
+    }
+}
+
+#[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
+impl AsFd for TcpListener {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.inner.as_fd()
+    }
+}
+
+#[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
+impl From<OwnedFd> for TcpListener {
+    /// Converts a `RawFd` to a `TcpListener`.
+    ///
+    /// # Notes
+    ///
+    /// The caller is responsible for ensuring that the socket is in
+    /// non-blocking mode.
+    fn from(fd: OwnedFd) -> Self {
+        TcpListener::from_std(From::from(fd))
     }
 }
 
@@ -246,29 +301,48 @@ impl FromRawSocket for TcpListener {
     }
 }
 
-#[cfg(target_os = "wasi")]
-impl IntoRawFd for TcpListener {
-    fn into_raw_fd(self) -> RawFd {
-        self.inner.into_inner().into_raw_fd()
+#[cfg(windows)]
+impl From<TcpListener> for OwnedSocket {
+    fn from(tcp_listener: TcpListener) -> Self {
+        tcp_listener.inner.into_inner().into()
     }
 }
 
-#[cfg(target_os = "wasi")]
-impl AsRawFd for TcpListener {
-    fn as_raw_fd(&self) -> RawFd {
-        self.inner.as_raw_fd()
+#[cfg(windows)]
+impl AsSocket for TcpListener {
+    fn as_socket(&self) -> BorrowedSocket<'_> {
+        self.inner.as_socket()
     }
 }
 
-#[cfg(target_os = "wasi")]
-impl FromRawFd for TcpListener {
-    /// Converts a `RawFd` to a `TcpListener`.
+#[cfg(windows)]
+impl From<OwnedSocket> for TcpListener {
+    /// Converts a `RawSocket` to a `TcpListener`.
     ///
     /// # Notes
     ///
     /// The caller is responsible for ensuring that the socket is in
     /// non-blocking mode.
-    unsafe fn from_raw_fd(fd: RawFd) -> TcpListener {
-        TcpListener::from_std(FromRawFd::from_raw_fd(fd))
+    fn from(socket: OwnedSocket) -> Self {
+        TcpListener::from_std(From::from(socket))
+    }
+}
+
+#[cfg(not(target_env = "sgx"))]
+impl From<TcpListener> for net::TcpListener {
+    fn from(listener: TcpListener) -> Self {
+        // Safety: This is safe since we are extracting the raw fd from a well-constructed
+        // mio::net::TcpListener which ensures that we actually pass in a valid file
+        // descriptor/socket
+        unsafe {
+            #[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
+            {
+                net::TcpListener::from_raw_fd(listener.into_raw_fd())
+            }
+            #[cfg(windows)]
+            {
+                net::TcpListener::from_raw_socket(listener.into_raw_socket())
+            }
+        }
     }
 }
